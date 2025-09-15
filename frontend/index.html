@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>JARVIS Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <canvas id="bg"></canvas>
+
+  <main id="hud">
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <span>J.A.R.V.I.S.</span>
+        <small>Just A Rather Very Intelligent System</small>
+      </div>
+
+      <div class="controls">
+        <input id="serverInput" type="text" value="http://localhost:8000" placeholder="Backend URL" />
+        <button id="connectBtn">Connect</button>
+        <button id="disconnectBtn" disabled>Disconnect</button>
+        <button id="listenOnceBtn">Listen Once</button>
+      </div>
+    </header>
+
+    <section class="center">
+      <div class="ring">
+        <div class="ring-core"></div>
+        <div class="ring-pulse"></div>
+      </div>
+
+      <div class="readouts">
+        <div class="row">
+          <span class="label">STATUS</span>
+          <span id="statusBadge" class="badge idle">IDLE</span>
+          <span class="pipe">|</span>
+          <span class="label">LATENCY</span>
+          <span id="latency">—</span>
+        </div>
+
+        <div class="textlines">
+          <div class="line">
+            <span class="chip">YOU</span>
+            <span id="transcript" class="glow"></span>
+          </div>
+          <div class="line">
+            <span class="chip accent">JARVIS</span>
+            <span id="reply" class="typepulse"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="log">
+      <div class="log-head">
+        <span>EVENT LOG</span>
+        <span id="connectionState" class="state">disconnected</span>
+      </div>
+      <div id="logStream" class="log-body"></div>
+    </section>
+  </main>
+
+  <script src="./ui.js" type="module"></script>
+</body>
+</html>
