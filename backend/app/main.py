@@ -1,28 +1,28 @@
 # backend/app/main.py
-import os, json
-from fastapi import FastAPI
+import os, json, asyncio, time
+from fastapi import FastAPI, Request
 from sse_starlette.sse import EventSourceResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 from .speech import detect_wake_and_record, transcribe, heard_wake
 from .brain import chat_and_route
 from .tts import speak
-from . import actions as act
-import asyncio, time, traceback
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or lock to http://localhost:5173 etc.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- NEW: env knobs
-LOCAL_ONLY = os.getenv("LOCAL_ONLY", "0") == "1"        # skip LLM entirely
-LLM_COOLDOWN_SEC = float(os.getenv("LLM_COOLDOWN_SEC", "45"))  # cooldown after 429
-IDLE_LOOP_SLEEP = float(os.getenv("IDLE_LOOP_SLEEP", "0.15"))  # loop sleep while idle/suppressed
+# --- env knobs ---
+LOCAL_ONLY = os.getenv("LOCAL_ONLY", "0") == "1"                 # if 1, never call LLM
+LLM_COOLDOWN_SEC = float(os.getenv("LLM_COOLDOWN_SEC", "45"))    # cooldown after 429
+IDLE_LOOP_SLEEP = float(os.getenv("IDLE_LOOP_SLEEP", "0.15"))    # idle loop sleep
+PING_INTERVAL_SEC = float(os.getenv("PING_INTERVAL_SEC", "15"))  # SSE keep-alive
+DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"
 
 @app.get("/health")
 def health():
@@ -35,295 +35,171 @@ async def listen_once():
     return {"transcript": text, "wake": heard_wake(text)}
 
 @app.get("/events")
-async def events():
-    DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"
-
+async def events(request: Request):
+    """
+    Server-Sent Events stream.
+    - Never drop the SSE connection on 429 (rate limit). Stay connected and emit 'app_error' + 'status: idle'.
+    - Send keep-alive pings to prevent proxies from idling out the stream.
+    """
     async def gen():
-        yield {"event": "status", "data": "idle"}
+        # helper: safe yield that exits cleanly if client is gone
+        async def emit(event: str, data):
+            if await request.is_disconnected():
+                raise asyncio.CancelledError()
+            text = data if isinstance(data, str) else json.dumps(data)
+            yield {"event": event, "data": text}
 
-        suppress_until = 0.0
+        # first status
+        async for chunk in emit("status", "idle"):
+            yield chunk
+
+        suppress_until = 0.0           # suppress mic while TTS speaks
+        llm_cooldown_until = 0.0       # cooldown if LLM rate-limits
         last_ping = time.monotonic()
 
-        while True:
-            now = time.monotonic()
+        try:
+            while True:
+                now = time.monotonic()
 
-            if now - last_ping > 15:
-                yield {"event": "ping", "data": f"{time.strftime('%Y-%m-%d %H:%M:%S')}"}
-                last_ping = now
+                # keep-alive ping every ~PING_INTERVAL_SEC
+                if now - last_ping > PING_INTERVAL_SEC:
+                    human = time.strftime("%Y-%m-%d %H:%M:%S")
+                    async for chunk in emit("ping", human):
+                        yield chunk
+                    last_ping = now
 
-            if now < suppress_until:
-                await asyncio.sleep(0.1)
-                continue
-
-            yield {"event": "status", "data": "listening"}
-            try:
-                wav = await asyncio.to_thread(detect_wake_and_record)
-            except Exception as e:
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": f"detect_error: {type(e).__name__}: {e}"}
-                await asyncio.sleep(0.3)
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            yield {"event": "status", "data": "processing"}
-            try:
-                text = await asyncio.to_thread(transcribe, wav)
-            except Exception as e:
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": f"transcribe_error: {type(e).__name__}: {e}"}
-                await asyncio.sleep(0.3)
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            wake = heard_wake(text)
-            # send transcript as JSON with wake flag so UI can decide what to show
-            payload = json.dumps({"text": text or "", "wake": wake})
-            yield {"event": "transcript", "data": payload}
-
-            if not wake:
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": "no_wake -> idle"}
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            # Local actions first
-            try:
-                a = act.maybe_handle(text)
-            except Exception as e:
-                a = None
-                yield {"event": "error", "data": f"action_router_error: {type(e).__name__}: {e}"}
-
-            if a and a.get("reply"):
-                yield {"event": "action", "data": str(a)}
-                try:
-                    speak(a["reply"])
-                except Exception as e:
-                    yield {"event": "error", "data": f"tts_error: {type(e).__name__}: {e}"}
-                yield {"event": "reply", "data": a["reply"]}
-                yield {"event": "status", "data": "idle"}
-                suppress_until = time.monotonic() + 2.0
-                continue
-
-            # Otherwise ask the LLM (guarded so 429s/5xx don’t kill the stream)
-            try:
-                result = await asyncio.to_thread(chat_and_route, text)
-                reply_text = result.get("reply", "").strip()
-                if not reply_text:
-                    if DEBUG_EVENTS:
-                        yield {"event": "debug", "data": "llm_empty_reply"}
-                    yield {"event": "status", "data": "idle"}
+                # suppression window (avoid hearing our own TTS)
+                if now < suppress_until:
+                    await asyncio.sleep(IDLE_LOOP_SLEEP)
                     continue
-            except Exception as e:
-                yield {"event": "error", "data": f"llm_error: {type(e).__name__}: {e}"}
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": "llm_error -> idle"}
-                yield {"event": "status", "data": "idle"}
-                suppress_until = time.monotonic() + 1.0
-                continue
 
-            try:
-                speak(reply_text)
-            except Exception as e:
-                yield {"event": "error", "data": f"tts_error: {type(e).__name__}: {e}"}
+                # capture one utterance
+                async for chunk in emit("status", "listening"):
+                    yield chunk
 
-            yield {"event": "reply", "data": reply_text}
-            yield {"event": "status", "data": "idle"}
-            suppress_until = time.monotonic() + 2.0
-
-    return EventSourceResponse(gen())
-    DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"
-
-    async def gen():
-        yield {"event": "status", "data": "idle"}
-
-        suppress_until = 0.0
-        last_ping = time.monotonic()
-
-        while True:
-            now = time.monotonic()
-
-            if now - last_ping > 15:
-                yield {"event": "ping", "data": f"{time.strftime('%Y-%m-%d %H:%M:%S')}"}
-                last_ping = now
-
-            if now < suppress_until:
-                await asyncio.sleep(0.1)
-                continue
-
-            yield {"event": "status", "data": "listening"}
-            try:
-                wav = await asyncio.to_thread(detect_wake_and_record)
-            except Exception as e:
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": f"detect_error: {type(e).__name__}: {e}"}
-                await asyncio.sleep(0.3)
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            yield {"event": "status", "data": "processing"}
-            try:
-                text = await asyncio.to_thread(transcribe, wav)
-            except Exception as e:
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": f"transcribe_error: {type(e).__name__}: {e}"}
-                await asyncio.sleep(0.3)
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            wake = heard_wake(text)
-            # send transcript as JSON with wake flag so UI can decide what to show
-            payload = json.dumps({"text": text or "", "wake": wake})
-            yield {"event": "transcript", "data": payload}
-
-            if not wake:
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": "no_wake -> idle"}
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            # Local actions first
-            try:
-                a = act.maybe_handle(text)
-            except Exception as e:
-                a = None
-                yield {"event": "error", "data": f"action_router_error: {type(e).__name__}: {e}"}
-
-            if a and a.get("reply"):
-                yield {"event": "action", "data": str(a)}
                 try:
-                    speak(a["reply"])
+                    wav = await asyncio.to_thread(detect_wake_and_record)
                 except Exception as e:
-                    yield {"event": "error", "data": f"tts_error: {type(e).__name__}: {e}"}
-                yield {"event": "reply", "data": a["reply"]}
-                yield {"event": "status", "data": "idle"}
-                suppress_until = time.monotonic() + 2.0
-                continue
-
-            # Otherwise ask the LLM (guarded so 429s/5xx don’t kill the stream)
-            try:
-                result = await asyncio.to_thread(chat_and_route, text)
-                reply_text = result.get("reply", "").strip()
-                if not reply_text:
                     if DEBUG_EVENTS:
-                        yield {"event": "debug", "data": "llm_empty_reply"}
-                    yield {"event": "status", "data": "idle"}
+                        async for chunk in emit("debug", f"detect_error: {type(e).__name__}: {e}"):
+                            yield chunk
+                    await asyncio.sleep(0.3)
+                    async for chunk in emit("status", "idle"):
+                        yield chunk
                     continue
-            except Exception as e:
-                yield {"event": "error", "data": f"llm_error: {type(e).__name__}: {e}"}
-                if DEBUG_EVENTS:
-                    yield {"event": "debug", "data": "llm_error -> idle"}
-                yield {"event": "status", "data": "idle"}
-                suppress_until = time.monotonic() + 1.0
-                continue
 
-            try:
-                speak(reply_text)
-            except Exception as e:
-                yield {"event": "error", "data": f"tts_error: {type(e).__name__}: {e}"}
-
-            yield {"event": "reply", "data": reply_text}
-            yield {"event": "status", "data": "idle"}
-            suppress_until = time.monotonic() + 2.0
-
-    return EventSourceResponse(gen())
-    async def gen():
-        yield {"event": "status", "data": "idle"}
-
-        suppress_until = 0.0          # suppress mic after TTS
-        llm_cooldown_until = 0.0      # --- NEW: global LLM cooldown after 429
-        last_ping = time.monotonic()
-
-        while True:
-            now = time.monotonic()
-
-            # keepalive ping every ~15s
-            if now - last_ping > 15:
-                yield {"event": "ping", "data": time.strftime("%Y-%m-%d %H:%M:%S")}
-                last_ping = now
-
-            # suppression window (avoid hearing our TTS)
-            if now < suppress_until:
-                await asyncio.sleep(IDLE_LOOP_SLEEP)
-                continue
-
-            # capture one utterance
-            yield {"event": "status", "data": "listening"}
-            try:
-                wav = await asyncio.to_thread(detect_wake_and_record)
-            except Exception as e:
-                yield {"event": "error", "data": f"detect_error: {type(e).__name__}: {e}"}
-                await asyncio.sleep(0.3)
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            yield {"event": "status", "data": "processing"}
-            try:
-                text = await asyncio.to_thread(transcribe, wav)
-            except Exception as e:
-                yield {"event": "error", "data": f"transcribe_error: {type(e).__name__}: {e}"}
-                await asyncio.sleep(0.3)
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            if heard_wake(text):
-                yield {"event": "transcript", "data": text or ""}
-            else:
-                # stay quiet in UI; just go idle again
-                yield {"event": "status", "data": "idle"}
-                continue
-
-            # Local actions FIRST
-            try:
-                a = act.maybe_handle(text)
-            except Exception as e:
-                a = None
-                yield {"event": "error", "data": f"action_router_error: {type(e).__name__}: {e}"}
-
-            if a and a.get("reply"):
-                yield {"event": "action", "data": str(a)}
+                # transcribe it
+                async for chunk in emit("status", "processing"):
+                    yield chunk
                 try:
-                    speak(a["reply"])
+                    text = await asyncio.to_thread(transcribe, wav)
                 except Exception as e:
-                    yield {"event": "error", "data": f"tts_error: {type(e).__name__}: {e}"}
-                yield {"event": "reply", "data": a["reply"]}
-                yield {"event": "status", "data": "idle"}
-                suppress_until = time.monotonic() + 2.0
-                continue
+                    if DEBUG_EVENTS:
+                        async for chunk in emit("debug", f"transcribe_error: {type(e).__name__}: {e}"):
+                            yield chunk
+                    await asyncio.sleep(0.3)
+                    async for chunk in emit("status", "idle"):
+                        yield chunk
+                    continue
 
-            # If LOCAL_ONLY or under cooldown, skip LLM
-            if LOCAL_ONLY or time.monotonic() < llm_cooldown_until:
+                # send transcript (with wake flag)
+                wake = heard_wake(text)
+                async for chunk in emit("transcript", {"text": text or "", "wake": wake}):
+                    yield chunk
+
+                # require wakeword before doing anything else
+                if not wake:
+                    if DEBUG_EVENTS:
+                        async for chunk in emit("debug", "no_wake -> idle"):
+                            yield chunk
+                    async for chunk in emit("status", "idle"):
+                        yield chunk
+                    continue
+
+                # optionally skip LLM entirely
+                if LOCAL_ONLY:
+                    if DEBUG_EVENTS:
+                        async for chunk in emit("debug", "LOCAL_ONLY=1 -> skipping LLM"):
+                            yield chunk
+                    async for chunk in emit("status", "idle"):
+                        yield chunk
+                    await asyncio.sleep(IDLE_LOOP_SLEEP)
+                    continue
+
+                # honor LLM cooldown (after a 429)
                 if time.monotonic() < llm_cooldown_until:
                     remaining = max(0, int(llm_cooldown_until - time.monotonic()))
-                    yield {"event": "error", "data": f"llm_cooldown_active: {remaining}s left"}
-                yield {"event": "status", "data": "idle"}
-                await asyncio.sleep(IDLE_LOOP_SLEEP)
-                continue
-
-            # Otherwise ask the LLM
-            try:
-                result = await asyncio.to_thread(chat_and_route, text)
-                if result.get("error") == "rate_limited":
-                    yield {"event": "error", "data": "llm_error: rate_limited"}
-                    # --- NEW: set global cooldown
-                    llm_cooldown_until = time.monotonic() + LLM_COOLDOWN_SEC
-                    yield {"event": "status", "data": "idle"}
+                    # stay connected; just inform the UI
+                    async for chunk in emit("app_error", f"llm_cooldown_active: {remaining}s left"):
+                        yield chunk
+                    async for chunk in emit("status", "idle"):
+                        yield chunk
+                    await asyncio.sleep(IDLE_LOOP_SLEEP)
                     continue
 
-                reply_text = (result.get("reply") or "").strip()
-            except Exception as e:
-                yield {"event": "error", "data": f"llm_error: {type(e).__name__}: {e}"}
-                yield {"event": "status", "data": "idle"}
-                # short suppression to avoid hot loop on generic failures
-                suppress_until = time.monotonic() + 3.0
-                continue
+                # route to LLM
+                try:
+                    # chat_and_route should return {"error":"rate_limited","retry_after": seconds?} on 429
+                    result = await asyncio.to_thread(chat_and_route, text)
 
-            try:
-                speak(reply_text)
-            except Exception as e:
-                yield {"event": "error", "data": f"tts_error: {type(e).__name__}: {e}"}
+                    # 429 path — DO NOT DROP SSE
+                    if result and result.get("error") == "rate_limited":
+                        retry_after = float(result.get("retry_after") or 0.0)
+                        cooldown = max(LLM_COOLDOWN_SEC, retry_after)
+                        llm_cooldown_until = time.monotonic() + cooldown
+                        async for chunk in emit("app_error", f"llm_error: rate_limited (cooldown {int(cooldown)}s)"):
+                            yield chunk
+                        async for chunk in emit("status", "idle"):
+                            yield chunk
+                        continue
 
-            yield {"event": "reply", "data": reply_text}
-            yield {"event": "status", "data": "idle"}
-            suppress_until = time.monotonic() + 2.0
+                    if result and result.get("error"):
+                        msg = result.get("message") or result.get("error")
+                        async for chunk in emit("app_error", f"llm_error: {msg}"):
+                            yield chunk
+                        async for chunk in emit("status", "idle"):
+                            yield chunk
+                        continue
 
-    return EventSourceResponse(gen())
+                    reply_text = (result.get("reply") or "").strip() if result else ""
+                    if not reply_text and DEBUG_EVENTS:
+                        async for chunk in emit("debug", "llm_empty_reply"):
+                            yield chunk
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # keep SSE alive; just log error and continue
+                    async for chunk in emit("app_error", f"llm_error: {type(e).__name__}: {e}"):
+                        yield chunk
+                    async for chunk in emit("status", "idle"):
+                        yield chunk
+                    suppress_until = time.monotonic() + 2.0
+                    continue
+
+                # speak & send reply
+                if reply_text:
+                    try:
+                        speak(reply_text)
+                    except Exception as e:
+                        async for chunk in emit("app_error", f"tts_error: {type(e).__name__}: {e}"):
+                            yield chunk
+                    async for chunk in emit("reply", reply_text):
+                        yield chunk
+
+                async for chunk in emit("status", "idle"):
+                    yield chunk
+                suppress_until = time.monotonic() + 2.0
+
+        except asyncio.CancelledError:
+            if DEBUG_EVENTS:
+                print("[events] client disconnected")
+            return
+        except GeneratorExit:
+            return
+
+    return EventSourceResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )

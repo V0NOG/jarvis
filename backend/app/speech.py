@@ -20,6 +20,8 @@ MIN_UTTER_MS = int(os.getenv("MIN_UTTER_MS", "500"))
 DEBUG_SPEECH = os.getenv("DEBUG_SPEECH", "0") == "1"
 DEBUG_SAVE_PREVIEW = os.getenv("DEBUG_SAVE_PREVIEW", "0") == "1"
 WAKE_STT_MODEL = os.getenv("WAKE_STT_MODEL", "base.en")
+END_SILENCE_MS = int(os.getenv("END_SILENCE_MS", "800"))
+MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "400"))
 
 # -------------------
 # STT models
@@ -143,7 +145,7 @@ def _text_matches_wake(text: str) -> bool:
     return False
 
 # -------------------
-# Wakeword checkers
+# Wakeword checkers (kept for debugging / future)
 # -------------------
 def _oww_hit(chunk_bytes: bytes) -> bool:
     if not oww:
@@ -187,9 +189,10 @@ def _text_wake_hit(preview_pcm: bytes) -> bool:
             pass
 
     voiced_ratio = (voiced_frames / total_frames) if total_frames else 0.0
-    if voiced_ratio < 0.25:  # a touch less strict for your current levels
+    THRESH = 0.20
+    if voiced_ratio < THRESH:
         if DEBUG_SPEECH:
-            print(f"[speech] wake reject: voiced_ratio {voiced_ratio:.2f} < 0.25")
+            print(f"[speech] wake reject: voiced_ratio {voiced_ratio:.2f} < {THRESH:.2f}")
         return False
 
     _maybe_save_preview(preview_pcm)
@@ -217,7 +220,7 @@ def _text_wake_hit(preview_pcm: bytes) -> bool:
         print(f"[speech] wake preview text='{text}' -> hit={hit} (rms={rms:.4f}, voiced={voiced_ratio:.2f})")
 
     # 4) Soft fallback if we clearly heard voice but text came back empty
-    if not hit and voiced_ratio >= 0.40:
+    if not hit and voiced_ratio >= 0.25:
         if DEBUG_SPEECH:
             print("[speech] wake soft-hit by voiced_ratio fallback")
         return True
@@ -225,7 +228,7 @@ def _text_wake_hit(preview_pcm: bytes) -> bool:
     return hit
 
 def _wake_gate(latest_chunk: bytes, wake_ring: bytes) -> bool:
-    """Return True when wakeword is detected in the preview window."""
+    """Return True when wakeword is detected in the preview window (unused in always-capture mode)."""
     if WAKEWORD_ENGINE == "oww":
         return _oww_hit(latest_chunk)
     max_bytes = int(SAMPLE_RATE * (WAKE_PREVIEW_MS / 1000.0)) * 2
@@ -233,20 +236,22 @@ def _wake_gate(latest_chunk: bytes, wake_ring: bytes) -> bool:
     return _text_wake_hit(preview)
 
 # -------------------
-# Main capture flow
+# Main capture flow (ALWAYS capture one utterance)
 # -------------------
 def detect_wake_and_record(max_silence_ms=1200, pre_roll_ms=300, min_voiced_ms=None):
     """
-    If wake word is enabled, wait for it (text or OWW).
-    Then record one utterance, stopping after ~max_silence_ms of unvoiced audio.
+    ALWAYS capture one utterance (no preview wake gate).
+    The caller will run transcribe() and then heard_wake(text) to decide whether to act.
     """
+    if max_silence_ms is None:
+        max_silence_ms = END_SILENCE_MS
     if min_voiced_ms is None:
-        min_voiced_ms = MIN_UTTER_MS
+        min_voiced_ms = max(MIN_UTTER_MS, MIN_UTTERANCE_MS)  # keep your old knob but prefer env
 
     with listen_stream():
         ring = b""         # consumed by VAD
-        wake_ring = b""    # last WAKE_PREVIEW_MS of audio
-        in_utterance = not USE_WAKEWORD
+        wake_ring = b""    # kept for optional debugging
+        in_utterance = True  # <-- always capture
         frames = []
         silence_ms = 0
         voiced_ms = 0
@@ -268,25 +273,10 @@ def detect_wake_and_record(max_silence_ms=1200, pre_roll_ms=300, min_voiced_ms=N
             ring += chunk
             wake_ring += chunk
 
-            # trim wake_ring to last WAKE_PREVIEW_MS
+            # trim wake_ring to last WAKE_PREVIEW_MS (debug only)
             max_wake_bytes = int(SAMPLE_RATE * (WAKE_PREVIEW_MS / 1000.0)) * 2
             if len(wake_ring) > max_wake_bytes:
                 wake_ring = wake_ring[-max_wake_bytes:]
-
-            # Wake gate
-            if USE_WAKEWORD and not in_utterance:
-                try:
-                    if _wake_gate(chunk, wake_ring):
-                        if DEBUG_SPEECH:
-                            print("[speech] WAKE TRIGGERED -> start utterance")
-                        in_utterance = True
-                        frames = []
-                        silence_ms = 0
-                        voiced_ms = 0
-                except Exception as e:
-                    if DEBUG_SPEECH:
-                        print(f"[speech] wake_gate error: {e}")
-                    in_utterance = False
 
             # Process fixed 20ms frames for VAD / capture
             while len(ring) >= FRAME_SAMPLES * 2:
@@ -313,7 +303,7 @@ def detect_wake_and_record(max_silence_ms=1200, pre_roll_ms=300, min_voiced_ms=N
                     else:
                         if voiced_ms >= min_voiced_ms:
                             silence_ms += FRAME_MS
-                            frames.append(frame)  # a bit of tail for natural end
+                            frames.append(frame)
                             if silence_ms >= max_silence_ms:
                                 if DEBUG_SPEECH:
                                     secs = len(b"".join(frames)) / (2 * SAMPLE_RATE)

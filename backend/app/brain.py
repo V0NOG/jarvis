@@ -2,7 +2,7 @@
 import os, time, random, requests
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")  # lighter by default
+LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("CHAT_MODEL", "gpt-4o-mini"))
 
 API_URL = "https://api.openai.com/v1/chat/completions"
 HEADERS = {
@@ -11,19 +11,17 @@ HEADERS = {
 }
 
 def _retry_delays():
-    # longer exponential backoff + jitter
     base = 1.0
-    for i in range(6):  # up to ~60s total
+    for _ in range(6):
         yield base
         base *= 2.0
 
 def chat_and_route(text: str) -> dict:
-    """Call LLM with decent backoff. Returns {'reply': str}."""
     if not OPENAI_API_KEY:
         return {"reply": "No API key configured."}
 
     body = {
-        "model": CHAT_MODEL,
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": "You are a concise voice assistant."},
             {"role": "user", "content": text or ""},
@@ -37,19 +35,29 @@ def chat_and_route(text: str) -> dict:
         try:
             r = requests.post(API_URL, headers=HEADERS, json=body, timeout=30)
             if r.status_code == 429:
-                # Return a sentinel so main can cool down.
-                return {"error": "rate_limited"}
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    retry_after = float(retry_after) if retry_after is not None else None
+                except Exception:
+                    retry_after = None
+                # Distinguish quota vs. rate-limit
+                try:
+                    msg = r.json().get("error", {}).get("message", "")
+                except Exception:
+                    msg = ""
+                kind = "quota_exceeded" if "quota" in msg.lower() else "rate_limited"
+                return {"error": kind, "retry_after": retry_after, "message": msg}
+
             r.raise_for_status()
             data = r.json()
             reply = data["choices"][0]["message"]["content"].strip()
             return {"reply": reply}
+
         except requests.HTTPError as e:
-            # Non-429: retry a couple times; then bubble up
             last_exc = e
         except Exception as e:
             last_exc = e
 
-        # jittered sleep before retry
         time.sleep(delay + random.random())
 
     if last_exc:

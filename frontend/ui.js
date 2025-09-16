@@ -1,9 +1,11 @@
+// frontend/ui.js
 const $ = (id) => document.getElementById(id);
 
 let es = null;
 let reconnectTimer = null;
 let lastPingAt = null;
 let backoffMs = 1000;
+let uiCooldownUntil = 0; // optional UI backoff window after LLM rate limits
 
 const statusBadge = $("statusBadge");
 const logStream = $("logStream");
@@ -45,7 +47,7 @@ function setConnectedUI(connected){
 
 function connect(){
   const base = $("serverInput").value.trim() || "http://localhost:8000";
-  if(es){ es.close(); es = null; }
+  if(es){ try{ es.close(); }catch{} es = null; }
   setConnectedUI(true);
   backoffMs = 1000;
 
@@ -58,59 +60,14 @@ function connect(){
     log("info","status", s);
   });
 
-    es.addEventListener("transcript", (ev)=>{
-      let txt = (ev.data || "").trim();
-      let wake = false;
-
-      if (type === 'transcript') {
-        let text = data;
-        let wake = false;
-        try {
-          const obj = JSON.parse(data);
-          text = obj.text ?? '';
-          wake = !!obj.wake;
-        } catch (_) {
-          // old server format: plain string
-        }
-
-        // Always log a line (so you can see what was heard),
-        // but only bubble it to the big HUD if wake=true
-        addLog('transcript', text + (wake ? ' [wake]' : ''));
-        if (wake) {
-          showYou(text);
-          ringFlash();
-        }
-        return;
-      }
-
-      if (type === 'debug') {
-        addLog('debug', data);
-        return;
-      }
-
-      // Backend now sends JSON: {"text":"...","wake":true|false}
-      try {
-          const obj = JSON.parse(txt);
-          txt = String(obj.text ?? "");
-          wake = !!obj.wake;
-      } catch (_) {
-          // old/plain format; keep txt as-is and infer wake via regex
-          wake = patterns.some(p => p.test(txt));
-      }
-
-      // Always log what was heard
-      log("info", "transcript", txt + (wake ? " [wake]" : ""));
-
-      // Only promote to the HUD if wake was actually detected
-      if (wake) {
-          transcriptEl.textContent = txt;
-          flashRing();
-      }
-    });
-
-    es.addEventListener("debug", (ev)=>{
-        log("debug", "debug", ev.data || "");
-    });
+  es.addEventListener("transcript", (ev)=>{
+    const obj = JSON.parse(ev.data || "{}");
+    const text = String(obj.text || "");
+    const wake = !!obj.wake;
+    transcriptEl.textContent = text;   // always show
+    if (wake) flashRing();
+    log("info", "transcript", text + (wake ? " [wake]" : ""));
+  });
 
   es.addEventListener("reply", (ev)=>{
     const txt = (ev.data || "").trim();
@@ -122,22 +79,37 @@ function connect(){
     log("action","action", ev.data || "");
   });
 
-  es.addEventListener("error", (ev)=>{
-    log("err","error", ev.data || "unknown error");
+  // Important: the server emits 'error' events but keeps SSE alive.
+  // We reflect in the UI without dropping the connection.
+  es.addEventListener("app_error", (ev)=>{
+    const msg = (ev.data || "unknown error").trim();
+    log("err","error", msg);
     statusBadge.className = "badge err";
     statusBadge.textContent = "ERROR";
+
+    // Optional client-side backoff if rate-limited
+    const m = msg.match(/rate_limited.*?(\d+)s/);
+    if (m) {
+      const seconds = parseInt(m[1], 10) || 0;
+      uiCooldownUntil = Date.now() + seconds * 1000;
+      log("info","cooldown", `UI cooling down for ${seconds}s`);
+    }
+  });
+
+  es.addEventListener("debug", (ev)=>{
+    log("debug", "debug", ev.data || "");
   });
 
   es.addEventListener("ping", (ev)=>{
     lastPingAt = performance.now();
-    // The server sends human time in data, we compute latency as “time since event”
     setTimeout(()=>{
       const ms = Math.floor(performance.now() - lastPingAt);
       latencyEl.textContent = `${ms} ms`;
     }, 0);
-    // keep alive log light
   });
 
+  // Do NOT close on server 'error' events (we keep SSE alive).
+  // Only reconnect if the transport itself errors out:
   es.onerror = () => {
     log("err","sse","connection lost");
     setConnectedUI(false);
@@ -171,6 +143,14 @@ $("connectBtn").onclick = connect;
 $("disconnectBtn").onclick = disconnect;
 
 $("listenOnceBtn").onclick = async ()=>{
+  // Optional: respect UI cooldown (user feedback, not required)
+  if (uiCooldownUntil && Date.now() < uiCooldownUntil) {
+    const left = Math.max(0, Math.ceil((uiCooldownUntil - Date.now())/1000));
+    log("info","listen-once","cooldown active, skipping");
+    typeReply(`Cooling down… try again in ${left}s`);
+    return;
+  }
+
   const base = $("serverInput").value.trim() || "http://localhost:8000";
   try{
     const r = await fetch(`${base}/listen-once`);
@@ -190,7 +170,7 @@ function typeReply(text){
   const tick = () => {
     if(i <= text.length){
       replyEl.textContent = text.slice(0,i);
-      i += Math.max(1, Math.floor(text.length/120)); // faster for long lines
+      i += Math.max(1, Math.floor(text.length/120));
       requestAnimationFrame(tick);
     }
   };
@@ -204,7 +184,7 @@ function flashRing(){
   setTimeout(()=> ring.style.filter = "", 180);
 }
 
-// Animated background grid/particles (subtle)
+// Animated background (unchanged)
 const canvas = $("bg");
 const ctx = canvas.getContext("2d", { alpha: true });
 let w=0,h=0, t=0; const parts = [];
@@ -227,7 +207,6 @@ function draw(){
   t += 0.0025;
   ctx.clearRect(0,0,w,h);
 
-  // grid
   ctx.strokeStyle = "rgba(23,48,85,0.35)";
   ctx.lineWidth = 1;
   const gx = 60 * devicePixelRatio, gy = 60 * devicePixelRatio;
@@ -238,7 +217,6 @@ function draw(){
     ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
   }
 
-  // particles
   for(const p of parts){
     const px = (p.x * w + Math.sin(t + p.p) * 40) ;
     const py = (p.y * h + Math.cos(t*1.2 + p.p) * 40) ;
